@@ -26,6 +26,9 @@ import org.eclipse.emf.common.command.Command;
 import org.eclipse.emf.common.command.IdentityCommand;
 import org.eclipse.emf.edit.domain.EditingDomain;
 import org.eclipse.gmf.runtime.notation.View;
+import org.eclipse.papyrus.uml.interaction.graph.GroupKind;
+import org.eclipse.papyrus.uml.interaction.graph.Tag;
+import org.eclipse.papyrus.uml.interaction.graph.Vertex;
 import org.eclipse.papyrus.uml.interaction.internal.model.impl.MElementImpl;
 import org.eclipse.papyrus.uml.interaction.internal.model.impl.MInteractionImpl;
 import org.eclipse.papyrus.uml.interaction.model.MElement;
@@ -33,8 +36,11 @@ import org.eclipse.papyrus.uml.interaction.model.MExecution;
 import org.eclipse.papyrus.uml.interaction.model.MInteraction;
 import org.eclipse.papyrus.uml.interaction.model.MLifeline;
 import org.eclipse.papyrus.uml.interaction.model.MMessage;
+import org.eclipse.papyrus.uml.interaction.model.MMessageEnd;
 import org.eclipse.papyrus.uml.interaction.model.MOccurrence;
 import org.eclipse.uml2.uml.Element;
+import org.eclipse.uml2.uml.Message;
+import org.eclipse.uml2.uml.MessageSort;
 
 /**
  * This command analyses the current graph and fills the white space created by the deletion of elements.
@@ -65,6 +71,7 @@ public class NudgeOnRemovalCommand extends ModelCommand<MInteractionImpl> {
 		this.mElementsToRemove = getRemovedMElements(elementsToRemove);
 
 		List<Command> nudgeCommands = new ArrayList<>();
+		nudgeCommands.addAll(createVerticalFullLifelineNudgeCommands());
 		nudgeCommands.addAll(createVerticalNudgeCommands());
 		nudgeCommands.addAll(createHorizontalNudgeCommands());
 
@@ -91,6 +98,67 @@ public class NudgeOnRemovalCommand extends ModelCommand<MInteractionImpl> {
 				.map(Optional::get)//
 				.filter(e -> !MOccurrence.class.isInstance(e))// TODO MGate special case once available
 				.collect(Collectors.toSet());
+	}
+
+	/**
+	 * When create messages are deleted we need to nudge full lifelines.
+	 */
+	private List<Command> createVerticalFullLifelineNudgeCommands() {
+		List<Command> nudgeCommands = new ArrayList<>();
+
+		List<MMessage> creationMessages = mElementsToRemove.stream()//
+				.filter(MMessage.class::isInstance)//
+				.map(MMessage.class::cast)//
+				.filter(m -> m.getElement().getMessageSort() == MessageSort.CREATE_MESSAGE_LITERAL)
+				.collect(Collectors.toList());
+
+		for (MMessage message : creationMessages) {
+			/* create message deletion should move created lifeline up again */
+			Optional<MLifeline> sender = message.getSender();
+			Optional<MLifeline> receiver = message.getReceiver();
+			if (!sender.isPresent() || !receiver.isPresent()) {
+				continue;
+			}
+
+			int defaultLifelineTop = getDefaultLifelineTop(receiver.get());
+			int delta = receiver.get().getTop().orElse(0) - defaultLifelineTop;
+			nudgeCommands.add(layoutHelper().setTop(vertex(receiver.get()), defaultLifelineTop));
+
+			/*
+			 * fix other tops on moved lifeline which may result in crooked ui by moving them down again
+			 */
+			receiver.get().getExecutions().stream()//
+					.map(this::vertex)//
+					.forEach(v -> nudgeCommands
+							.add(layoutHelper().setTop(v, layoutHelper().getTop(v).orElse(0) + delta)));
+			for (MMessage m : receiver.get().getInteraction().getMessages()) {
+				m.getSender().ifPresent(l -> {
+					if (l == receiver.get()) {
+						Vertex v = vertex(m.getSend().get());
+						nudgeCommands
+								.add(layoutHelper().setTop(v, layoutHelper().getTop(v).orElse(0) + delta));
+					}
+				});
+				m.getReceiver().ifPresent(l -> {
+					if (l == receiver.get()) {
+						Vertex v = vertex(m.getReceive().get());
+						nudgeCommands
+								.add(layoutHelper().setTop(v, layoutHelper().getTop(v).orElse(0) + delta));
+					}
+				});
+			}
+		}
+
+		return nudgeCommands;
+	}
+
+	@SuppressWarnings("boxing")
+	private int getDefaultLifelineTop(MLifeline lifeline) {
+		/* move lifeline header up to very top */
+		// TODO magic number 25 from
+		// org.eclipse.papyrus.uml.interaction.internal.model.spi.impl.DefaultLayoutHelper.getNewBounds(EClass,
+		// Bounds, Node)
+		return lifeline.getDiagramView().map(v -> layoutHelper().toAbsoluteY(v, 25)).orElse(0);
 	}
 
 	@SuppressWarnings("boxing")
@@ -134,10 +202,13 @@ public class NudgeOnRemovalCommand extends ModelCommand<MInteractionImpl> {
 					.collect(Collectors.toSet());
 			Optional<Integer> min = topsStartingAfter.stream().min(Integer::compare);
 			int delta = topFinal - min.orElse(topFinal) + additionalVerticalOffSet();
-			topsStartingAfter.stream()//
+			List<MElement<? extends Element>> elementsToNudge = topsStartingAfter.stream()//
 					.flatMap(key -> topToElements.get(key).stream())//
-					.forEach(element -> nudgeCommands
-							.add(new NudgeCommand((MElementImpl<? extends Element>)element, delta, false)));
+					.collect(Collectors.toList());
+			Set<MLifeline> movedLifelines = findMovedLifelines(elementsToNudge);
+			elementsToNudge.stream()//
+					.forEach(
+							element -> nudgeCommands.add(createNudgeCommand(delta, element, movedLifelines)));
 		}
 
 		/* find out if we have to move elements which start after the deleted range */
@@ -162,12 +233,90 @@ public class NudgeOnRemovalCommand extends ModelCommand<MInteractionImpl> {
 				delta = topFinal - min.orElse(topFinal) + additionalVerticalOffSet();
 			}
 
-			topsBelowDeletion.stream()//
+			List<MElement<? extends Element>> elementsToNudge = topsBelowDeletion.stream()//
 					.flatMap(key -> topToElements.get(key).stream())//
-					.forEach(element -> nudgeCommands
-							.add(new NudgeCommand((MElementImpl<? extends Element>)element, delta, false)));
+					.collect(Collectors.toList());
+			Set<MLifeline> movedLifelines = findMovedLifelines(elementsToNudge);
+			elementsToNudge.stream()//
+					.forEach(
+							element -> nudgeCommands.add(createNudgeCommand(delta, element, movedLifelines)));
 		}
 		return nudgeCommands;
+	}
+
+	private Set<MLifeline> findMovedLifelines(List<MElement<? extends Element>> elementsToNudge) {
+		return elementsToNudge.stream()//
+				.filter(MMessage.class::isInstance)//
+				.map(MMessage.class::cast)//
+				.map(MMessage::getElement)//
+				.map(Message::getReceiveEvent)//
+				.map(this::vertex)//
+				.filter(v -> v.hasTag(Tag.LIFELINE_CREATION))//
+				.map(v -> v.group(GroupKind.LIFELINE))//
+				.filter(Optional::isPresent)//
+				.map(Optional::get)//
+				.map(Vertex.class::cast)//
+				.map(Vertex::getInteractionElement)//
+				.map(interaction::getElement)//
+				.filter(Optional::isPresent)//
+				.map(Optional::get)//
+				.map(MLifeline.class::cast)//
+				.collect(Collectors.toSet());
+	}
+
+	/**
+	 * Creates the command which will nudge the given elements. Based on the moved lifelines, this may only
+	 * move message ends or nothing at all.
+	 */
+	private Command createNudgeCommand(int delta, MElement<? extends Element> element,
+			Set<MLifeline> movedLifelines) {
+
+		if (movedLifelines.isEmpty()) {
+			return new NudgeCommand((MElementImpl<? extends Element>)element, delta, false);
+		}
+
+		/*
+		 * move of lifeline will already move elements on it, so we have to pay special attention to not move
+		 * twice
+		 */
+		if (element instanceof MExecution) {
+			/* if we are an execution */
+			MExecution execution = (MExecution)element;
+			if (movedLifelines.contains(execution.getOwner())) {
+				return IdentityCommand.INSTANCE;
+			}
+		} else if (element instanceof MMessage) {
+			MMessage message = (MMessage)element;
+			if (message.getElement().getMessageSort() == MessageSort.CREATE_MESSAGE_LITERAL) {
+				return new NudgeCommand((MElementImpl<? extends Element>)element, delta, false);
+			}
+			boolean dontMoveSend = message.getSender().isPresent()
+					&& movedLifelines.contains(message.getSender().get());
+			boolean dontMoveRecv = message.getReceiver().isPresent()
+					&& movedLifelines.contains(message.getReceiver().get());
+
+			if (dontMoveSend && dontMoveRecv) {
+				return IdentityCommand.INSTANCE;
+			}
+
+			if (dontMoveSend) {
+				/* fix recv end */
+				if (message.getReceive().isPresent()) {
+					MMessageEnd messageEnd = message.getReceive().get();
+					return layoutHelper().setTop(vertex(messageEnd), messageEnd.getTop().orElse(0));
+				}
+			}
+
+			if (dontMoveRecv) {
+				/* fix send end */
+				if (message.getSend().isPresent()) {
+					MMessageEnd messageEnd = message.getSend().get();
+					return layoutHelper().setTop(vertex(messageEnd), messageEnd.getTop().orElse(0));
+				}
+
+			}
+		}
+		return new NudgeCommand((MElementImpl<? extends Element>)element, delta, false);
 	}
 
 	/**

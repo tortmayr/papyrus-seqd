@@ -14,7 +14,9 @@ package org.eclipse.papyrus.uml.interaction.model.tests;
 
 import org.eclipse.papyrus.uml.interaction.internal.model.spi.impl.tests.DefaultLayoutHelperTest;
 import org.eclipse.papyrus.uml.interaction.internal.model.spi.impl.tests.LogicalModelAdapterTest;
+import org.eclipse.papyrus.uml.interaction.model.tests.creation.CreateMessageTest;
 import org.eclipse.papyrus.uml.interaction.model.tests.deletion.BasicDeletionTest;
+import org.eclipse.papyrus.uml.interaction.model.tests.deletion.CreationMessageDeletionTest;
 import org.junit.runner.RunWith;
 import org.junit.runners.Suite;
 import org.junit.runners.Suite.SuiteClasses;
@@ -27,9 +29,12 @@ import org.junit.runners.Suite.SuiteClasses;
 @RunWith(Suite.class)
 @SuiteClasses({ //
 		DefaultLayoutHelperTest.class, //
+		CreateMessageTest.class, //
+		CreationMessageDeletionTest.class, //
 		BasicDeletionTest.class, //
 		LogicalModelAdapterTest.class, //
 })
+
 public class SeqDCustomTests {
 
 	/**

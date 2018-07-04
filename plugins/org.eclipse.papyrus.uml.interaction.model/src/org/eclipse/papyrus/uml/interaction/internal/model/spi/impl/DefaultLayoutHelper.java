@@ -798,6 +798,10 @@ public class DefaultLayoutHelper implements LayoutHelper {
 		if (eClass.getEPackage() == UMLPackage.eINSTANCE) {
 			switch (eClass.getClassifierID()) {
 				case UMLPackage.LIFELINE:
+					// TODO the magic number 25 is referenced from
+					// org.eclipse.papyrus.uml.interaction.internal.model.commands.InsertMessageCommand.nestedOffSet()
+					// and
+					// org.eclipse.papyrus.uml.interaction.internal.model.commands.NudgeOnRemovalCommand.getDefaultLifelineTop(MLifeline)
 					result.setY(25);
 					result.setWidth(100);
 					result.setHeight(28);

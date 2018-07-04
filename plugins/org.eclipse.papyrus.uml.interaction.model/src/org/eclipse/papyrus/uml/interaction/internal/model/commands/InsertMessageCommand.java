@@ -15,19 +15,29 @@ package org.eclipse.papyrus.uml.interaction.internal.model.commands;
 import static java.lang.Math.max;
 import static org.eclipse.papyrus.uml.interaction.graph.util.Suppliers.compose;
 
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.eclipse.emf.common.command.Command;
 import org.eclipse.emf.common.command.UnexecutableCommand;
+import org.eclipse.gmf.runtime.notation.Shape;
 import org.eclipse.gmf.runtime.notation.View;
 import org.eclipse.papyrus.uml.interaction.graph.Vertex;
+import org.eclipse.papyrus.uml.interaction.internal.model.impl.MElementImpl;
 import org.eclipse.papyrus.uml.interaction.internal.model.impl.MLifelineImpl;
 import org.eclipse.papyrus.uml.interaction.model.CreationCommand;
 import org.eclipse.papyrus.uml.interaction.model.CreationParameters;
 import org.eclipse.papyrus.uml.interaction.model.MElement;
 import org.eclipse.papyrus.uml.interaction.model.MLifeline;
+import org.eclipse.papyrus.uml.interaction.model.MMessage;
 import org.eclipse.papyrus.uml.interaction.model.spi.DeferredAddCommand;
 import org.eclipse.papyrus.uml.interaction.model.spi.SemanticHelper;
 import org.eclipse.uml2.uml.Element;
@@ -172,6 +182,17 @@ public class InsertMessageCommand extends ModelCommand<MLifelineImpl> implements
 			return UnexecutableCommand.INSTANCE;
 		}
 
+		switch (sort) {
+			case CREATE_MESSAGE_LITERAL:
+				/* receiver must have no elements before */
+				if (this.receiver.elementAt(recvOffset + relativeTopOfBefore()).isPresent()) {
+					return UnexecutableCommand.INSTANCE;
+				}
+				break;
+			default:
+				break;
+		}
+
 		MElement<? extends Element> sendInsertionPoint = normalizeFragmentInsertionPoint(beforeSend);
 		MElement<? extends Element> recvInsertionPoint = normalizeFragmentInsertionPoint(beforeRecv);
 
@@ -196,24 +217,148 @@ public class InsertMessageCommand extends ModelCommand<MLifelineImpl> implements
 
 		// And the diagram visualization
 		Function<View, View> lifelineBody = diagramHelper()::getLifelineBodyShape;
+
+		/* find the target based on message type */
+		Supplier<? extends View> target;
+		switch (sort) {
+			case CREATE_MESSAGE_LITERAL:
+				/* creation message should connect to lifeline header */
+				target = receiver::getDiagramView;
+				break;
+
+			default:
+				/* others should connect to lifelinebody */
+				target = compose(receiver::getDiagramView, lifelineBody);
+				break;
+		}
+
+		/* create message */
 		result = result.chain(diagramHelper().createMessageConnector(resultCommand, //
-				compose(sender::getDiagramView, lifelineBody), () -> sendReferenceY.getAsInt() + sendOffset, //
-				compose(receiver::getDiagramView, lifelineBody),
+				compose(sender::getDiagramView, lifelineBody), //
+				() -> sendReferenceY.getAsInt() + sendOffset, //
+				target, //
 				() -> recvReferenceY.getAsInt() + recvOffset));
 
-		// Now we have commands to add the message specification. But, first we must make
-		// room for it in the diagram. Nudge the element that will follow the new receive event
-		int spaceRequired = 2 * sendOffset;
-		MElement<?> distanceFrom = sendInsertionPoint;
-		Optional<Command> makeSpace = getTarget().following(sendInsertionPoint).map(el -> {
-			OptionalInt distance = el.verticalDistance(distanceFrom);
-			return distance.isPresent() ? el.nudge(max(0, spaceRequired - distance.getAsInt())) : null;
-		});
-		if (makeSpace.isPresent()) {
-			result = makeSpace.get().chain(result);
+		switch (sort) {
+			case CREATE_MESSAGE_LITERAL:
+				List<Command> commands = new ArrayList<>(3);
+
+				View receiverShape = (this.receiver).getDiagramView().orElse(null);
+				int receiverBodyTop = layoutHelper()
+						.getTop(diagramHelper().getLifelineBodyShape(receiverShape));
+				int receiverLifelineTop = this.receiver.getTop().orElse(0);
+
+				int receiverDeltaY = recvOffset + ((receiverBodyTop - receiverLifelineTop) / 2)
+						+ nestedOffSet();
+
+				if (beforeSend != getTarget()) {
+					receiverDeltaY += relativeTopOfBefore();
+				}
+
+				int receiverDeltaYFinal = receiverDeltaY;
+
+				/* first make room to move created lifeline down */
+				int creationMessageTop = recvReferenceY.getAsInt() + recvOffset;
+				Set<MElementImpl<? extends Element>> elementsToNudge = new LinkedHashSet<>();
+
+				/* messages */
+				findElementsToNudge(creationMessageTop, elementsToNudge,
+						getTarget().getInteraction().getMessages().stream());
+				/* lifelines */
+				findElementsToNudge(creationMessageTop, elementsToNudge,
+						getTarget().getInteraction().getLifelines().stream());
+				/* executions */
+				findElementsToNudge(creationMessageTop, elementsToNudge,
+						getTarget().getInteraction().getLifelines().stream()//
+								.filter(m -> m.getTop().orElse(0) < creationMessageTop)//
+								.flatMap(l -> l.getExecutions().stream()));
+
+				List<Command> nudgeCommands = elementsToNudge.stream()
+						.map(e -> new NudgeCommand(e, receiverDeltaYFinal, false))//
+						.collect(Collectors.toList());
+
+				if (!nudgeCommands.isEmpty()) {
+					commands.add(CompoundModelCommand.compose(getEditingDomain(), nudgeCommands));
+				}
+
+				/* then move created/receiving lifeline down */
+				commands.add(new NudgeCommand((MLifelineImpl)this.receiver, receiverDeltaY, false));
+
+				/*
+				 * finally move children on lifeline up again, as they had been touched in the first step
+				 * already
+				 */
+				List<Command> fixCommands = new ArrayList<>();
+				this.receiver.getExecutions().stream()//
+						.map(this::vertex)//
+						.forEach(v -> fixCommands
+								.add(layoutHelper().setTop(v, layoutHelper().getTop(v).orElse(0))));
+				for (MMessage m : this.receiver.getInteraction().getMessages()) {
+					m.getSender().ifPresent(l -> {
+						if (l == this.receiver) {
+							Vertex v = vertex(m.getSend().get());
+							fixCommands.add(layoutHelper().setTop(v, layoutHelper().getTop(v).orElse(0)));
+						}
+					});
+					m.getReceiver().ifPresent(l -> {
+						if (l == this.receiver) {
+							Vertex v = vertex(m.getReceive().get());
+							fixCommands.add(layoutHelper().setTop(v, layoutHelper().getTop(v).orElse(0)));
+						}
+					});
+				}
+
+				if (!fixCommands.isEmpty()) {
+					commands.add(CompoundModelCommand.compose(getEditingDomain(), fixCommands));
+				}
+
+				/* build final command */
+				result = CompoundModelCommand.compose(getEditingDomain(), commands).chain(result);
+				break;
+
+			default:
+				// Now we have commands to add the message specification. But, first we must make
+				// room for it in the diagram. Nudge the element that will follow the new receive event
+				int spaceRequired = 2 * sendOffset;
+				MElement<?> distanceFrom = sendInsertionPoint;
+				Optional<Command> makeSpace = getTarget().following(sendInsertionPoint).map(el -> {
+					OptionalInt distance = el.verticalDistance(distanceFrom);
+					return distance.isPresent() ? el.nudge(max(0, spaceRequired - distance.getAsInt()))
+							: null;
+				});
+				if (makeSpace.isPresent()) {
+					result = makeSpace.get().chain(result);
+				}
+				break;
 		}
 
 		return result;
+	}
+
+	/* in case we are dealing with nested created lifelines we need to take additional offset into account */
+	private int nestedOffSet() {
+		Optional<Shape> diagramView = getTarget().getDiagramView();
+		if (!diagramView.isPresent()) {
+			return 0;
+		}
+		int absoluteTop = layoutHelper().getTop(diagramView.get());
+		int relativeTop = layoutHelper().toRelativeY(diagramView.get(), absoluteTop);
+		// TODO magic number 25 from
+		// org.eclipse.papyrus.uml.interaction.internal.model.spi.impl.DefaultLayoutHelper.getNewBounds(EClass,
+		// Bounds, Node)
+		return relativeTop - 25;
+	}
+
+	private int relativeTopOfBefore() {
+		return beforeSend.getTop().getAsInt() - layoutHelper().getBottom(getTarget().getDiagramView().get());
+	}
+
+	private static void findElementsToNudge(int creationMessageTop,
+			Set<MElementImpl<? extends Element>> elementsToNudge, Stream<?> stream) {
+		stream//
+				.filter(MElementImpl.class::isInstance).map(MElementImpl.class::cast)
+				.filter(m -> m.getTop().orElse(0) >= creationMessageTop)//
+				.collect(Collectors.toCollection(() -> elementsToNudge));
 	}
 
 	private CreationParameters endParams(MElement<? extends Element> insertionPoint) {
